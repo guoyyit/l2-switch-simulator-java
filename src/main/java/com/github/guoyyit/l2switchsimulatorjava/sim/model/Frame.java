@@ -14,13 +14,15 @@ import java.util.Objects;
  */
 public final class Frame {
 
+    private final long id;
     private final MacAddress src;
     private final MacAddress dst;
     private final int vlan;
     private final FramePriority priority;
     private final String payload;
 
-    public Frame(MacAddress src, MacAddress dst, int vlan, FramePriority priority, String payload) {
+    public Frame(long id, MacAddress src, MacAddress dst, int vlan, FramePriority priority, String payload) {
+        this.id = id;
         this.src = Objects.requireNonNull(src, "src");
         this.dst = Objects.requireNonNull(dst, "dst");
         if (src.isGroup()) {
@@ -32,6 +34,11 @@ public final class Frame {
         this.vlan = vlan;
         this.priority = Objects.requireNonNull(priority, "priority");
         this.payload = payload == null ? "" : payload;
+    }
+
+    @JsonProperty
+    public long id() {
+        return id;
     }
 
     @JsonProperty
@@ -83,7 +90,8 @@ public final class Frame {
         if (!(o instanceof Frame other)) {
             return false;
         }
-        return vlan == other.vlan
+        return id == other.id
+                && vlan == other.vlan
                 && src.equals(other.src)
                 && dst.equals(other.dst)
                 && priority == other.priority
@@ -92,7 +100,8 @@ public final class Frame {
 
     @Override
     public int hashCode() {
-        int result = src.hashCode();
+        int result = Long.hashCode(id);
+        result = 31 * result + src.hashCode();
         result = 31 * result + dst.hashCode();
         result = 31 * result + vlan;
         result = 31 * result + priority.hashCode();
@@ -102,6 +111,6 @@ public final class Frame {
 
     @Override
     public String toString() {
-        return "Frame[" + src + "->" + dst + " vlan=" + vlan + " p=" + priority.value() + " '" + payload + "']";
+        return "Frame#" + id + "[" + src + "->" + dst + " vlan=" + vlan + " p=" + priority.value() + " '" + payload + "']";
     }
 }

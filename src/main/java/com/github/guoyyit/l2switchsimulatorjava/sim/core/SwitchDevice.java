@@ -10,12 +10,12 @@ import com.github.guoyyit.l2switchsimulatorjava.sim.model.PortFault;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.PortView;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.SwitchConfig;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.SwitchView;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.DecisionSource;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Random;
 
 /**
  * 单台仿真交换机。
@@ -58,20 +58,21 @@ public final class SwitchDevice {
         PortFault fault = PortFault.none();
         final PortQueues queues;
         StormGuard storm;
-        final Random faultRng;
         long rxFrames;
         long txFrames;
         long learned;
         long flooded;
+        long floodCopies;
+        long floodOps;
+        long filtered;
         long dropped;
         long pausedTicks;
 
-        Port(int id, boolean hostFacing, int vlan, PortConfig config, Random faultRng) {
+        Port(int id, boolean hostFacing, int vlan, PortConfig config) {
             this.id = id;
             this.hostFacing = hostFacing;
             this.vlan = vlan;
             this.config = config;
-            this.faultRng = faultRng;
             this.queues = new PortQueues(config.capacityPerPriority());
             this.storm = new StormGuard(config.stormThreshold(), config.stormWindow(), config.stormAction());
         }
@@ -82,16 +83,16 @@ public final class SwitchDevice {
     }
 
     private final String name;
-    private final long seed;
     private long agingTicks;
     private final List<Port> ports = new ArrayList<>();
     private ForwardingTable fdb;
+    private final DecisionSource decisionSource;
 
-    public SwitchDevice(String name, SwitchConfig config) {
+    public SwitchDevice(String name, SwitchConfig config, DecisionSource decisionSource) {
         this.name = name;
-        this.seed = config.seed();
         this.agingTicks = config.agingTicks();
         this.fdb = new ForwardingTable(agingTicks);
+        this.decisionSource = java.util.Objects.requireNonNull(decisionSource, "decisionSource");
     }
 
     public String name() {
@@ -111,8 +112,7 @@ public final class SwitchDevice {
 
     public int addPort(PortConfig config, boolean hostFacing) {
         int id = ports.size();
-        long portSeed = seed ^ (0x9E3779B97F4A7C15L * (id + 1L));
-        ports.add(new Port(id, hostFacing, 1, config, new Random(portSeed)));
+        ports.add(new Port(id, hostFacing, 1, config));
         return id;
     }
 
@@ -222,23 +222,32 @@ public final class SwitchDevice {
 
     private void drainDropped(Port p, EventSink sink) {
         DropReason reason = p.enabled ? DropReason.LOOP_BLOCKED_INGRESS : DropReason.DISABLED_INGRESS;
-        Frame f;
-        while ((f = p.queues.pollIngress()) != null) {
+        IngressFrame f;
+        while ((f = p.queues.pollIngressFrame()) != null) {
             p.dropped++;
-            sink.dropped(p.id, reason, f);
+            sink.dropped(p.id, reason, f.frame);
         }
     }
 
     private void processOnePortIngress(Port p, long now, EventSink sink) {
         boolean skipSwapForHead = false;
         while (true) {
-            Frame frame = p.queues.peekIngress();
-            if (frame == null) {
+            IngressFrame head = p.queues.peekIngressFrame();
+            if (head == null) {
                 return;
             }
-            // 故障丢帧：端口独立的确定性随机源，不影响其他端口的随机序列
-            if (p.fault.dropRate() > 0.0 && p.faultRng.nextDouble() < p.fault.dropRate()) {
-                p.queues.pollIngress();
+            Frame frame = head.frame;
+            // 故障丢帧判定：每帧只抛一次硬币，重试（暂停/限速）不改变命运
+            if (!head.faultDecided) {
+                head.faultDecided = true;
+                if (p.fault.dropRate() > 0.0
+                        && decisionSource.nextDouble(DecisionSource.Coin.FAULT, name, p.id, frame.id(), now)
+                        < p.fault.dropRate()) {
+                    head.faultDrop = true;
+                }
+            }
+            if (head.faultDrop) {
+                p.queues.pollIngressFrame();
                 p.dropped++;
                 sink.dropped(p.id, DropReason.FAULT_DROP, frame);
                 skipSwapForHead = false;
@@ -248,14 +257,19 @@ public final class SwitchDevice {
             // 命中则与后继交换并立即处理后继，被换到队首的原队首跳过下一次抛硬币，
             // 因此每帧至多参与一次交换，结果确定且不会来回抖动
             if (!skipSwapForHead && p.fault.reorderEnabled() && p.queues.ingressDepth() >= 2
-                    && p.faultRng.nextDouble() < 0.5) {
-                frame = p.queues.swapAndPollFirstTwo();
+                    && decisionSource.nextDouble(DecisionSource.Coin.REORDER, name, p.id, frame.id(), now) < 0.5) {
+                head = p.queues.swapAndPollFirstTwo();
+                frame = head.frame;
                 skipSwapForHead = true;
             } else {
-                p.queues.pollIngress();
+                p.queues.pollIngressFrame();
                 skipSwapForHead = false;
             }
-            p.rxFrames++;
+            // 接收计数：每帧只计一次，重试不重复
+            if (!head.rxCounted) {
+                head.rxCounted = true;
+                p.rxFrames++;
+            }
 
             if (fdb.learn(frame.src(), p.id, frame.vlan(), now)) {
                 p.learned++;
@@ -269,26 +283,26 @@ public final class SwitchDevice {
                 result = handleUnicast(p, frame, now, sink);
             }
             if (result == IngressResult.RETRY_HEAD) {
-                requeueAtHead(p, frame);
+                requeueAtHead(p, head);
                 return;
             }
             if (result == IngressResult.PAUSED) {
-                requeueAtHead(p, frame);
+                requeueAtHead(p, head);
                 p.queues.setIngressPaused(true);
                 return;
             }
         }
     }
 
-    private void requeueAtHead(Port p, Frame frame) {
-        List<Frame> rest = new ArrayList<>();
-        Frame f;
-        while ((f = p.queues.pollIngress()) != null) {
+    private void requeueAtHead(Port p, IngressFrame head) {
+        List<IngressFrame> rest = new ArrayList<>();
+        IngressFrame f;
+        while ((f = p.queues.pollIngressFrame()) != null) {
             rest.add(f);
         }
-        p.queues.offerIngress(frame);
-        for (Frame r : rest) {
-            p.queues.offerIngress(r);
+        p.queues.offerIngressFrame(head);
+        for (IngressFrame r : rest) {
+            p.queues.offerIngressFrame(r);
         }
     }
 
@@ -316,6 +330,7 @@ public final class SwitchDevice {
         Port out = ports.get(target.get().portId());
         if (out.id == p.id) {
             // 目的与源在同一端口（如发往本端口下挂主机），交换机静默过滤
+            p.filtered++;
             return IngressResult.DONE;
         }
         if (out.vlan != frame.vlan()) {
@@ -372,6 +387,8 @@ public final class SwitchDevice {
             }
         }
         in.flooded += copies;
+        in.floodCopies += candidates.size();
+        in.floodOps++;
         for (int i = 0; i < copies; i++) {
             sink.flooded(in.id, frame);
         }
@@ -432,7 +449,8 @@ public final class SwitchDevice {
             PortCountersView c = new PortCountersView(p.rxFrames, p.txFrames, p.learned, p.flooded,
                     p.dropped, p.pausedTicks);
             portViews.add(new PortView(p.id, p.enabled, p.blocked, p.hostFacing,
-                    p.queues.isIngressPaused(), p.vlan, p.attachedHost, p.fault, p.queues.depths(), c));
+                    p.queues.isIngressPaused(), p.vlan, p.attachedHost, p.fault, p.queues.depths(),
+                    p.queues.ingressDepth(), c));
             rx += p.rxFrames;
             tx += p.txFrames;
             learned += p.learned;
@@ -451,5 +469,22 @@ public final class SwitchDevice {
                 Map.copyOf(totals));
     }
 
-}
+    /** 泛洪净增副本数：每次泛洪消耗 1 个原始帧、产生 N 个副本，净增 N-1。 */
+    long floodNetCopies() {
+        long net = 0;
+        for (Port p : ports) {
+            net += p.floodCopies - p.floodOps;
+        }
+        return net;
+    }
 
+    /** 同端口静默过滤的帧数（消耗原始帧、不产生副本）。 */
+    long filtered() {
+        long n = 0;
+        for (Port p : ports) {
+            n += p.filtered;
+        }
+        return n;
+    }
+
+}

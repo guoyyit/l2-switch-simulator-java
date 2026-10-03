@@ -14,9 +14,9 @@
 | 3 | 未知单播泛洪/已知单播/广播/组播 | 入端口不发副本，严格按 VLAN 转发域约束 |
 | 4 | 环路防护与风暴控制 | `Topology` 用确定性并查集生成树阻断成环端口（主机端口永不阻断）；`StormGuard` 滑动窗口阈值，超阈值 DROP 或 LIMIT 限速 |
 | 5 | 背压与优先级队列 | 每优先级队列有独立容量上限；严格优先级 + 等待老化抬升，低优先级不被饿死；队列满按 `DROP` 或 `PAUSE`（暂停入端口）处理 |
-| 6 | 确定性回放与故障注入 | 所有随机源为按 `(交换机种子, 端口)` 派生的专属 `Random`；同种子同事件序列结果逐次一致；某端口故障不消耗其他端口随机序列 |
-| 7 | 状态查询与统计 | 所有读写在 `Simulation` 的同一把锁内串行；`snapshot()` 返回不可变视图，并发查询看不到部分更新；端口计数、FDB、丢弃原因三者自洽 |
-| 8 | 自动化测试与文档 | 36 个测试覆盖学习老化、泛洪环路、队列背压、故障/风暴、并发统计与 HTTP 接口 |
+| 6 | 确定性回放与故障注入 | 所有随机源为按 `(交换机种子, 端口)` 派生的专属 `Random`；运行期持续记录影响转发的事件序列（顺序号、逻辑时间、交换机/端口、帧标识、故障判定与丢弃结果）；回放时按日志逐次重放判定，同事件序列多次回放与原始运行逐次一致；某端口故障不消耗其他端口随机序列 |
+| 7 | 状态查询与统计 | 所有读写在 `Simulation` 的同一把锁内串行；`snapshot()` 返回不可变视图，并发查询看不到部分更新；端口计数、FDB、丢弃原因三者自洽；帧守恒（注入+泛洪净副本==送达+丢弃+队列+过滤） |
+| 8 | 自动化测试与文档 | 48 个测试覆盖学习老化、泛洪环路、队列背压、故障/风暴、事件回放一致性/隔离/范围校验、重试计数一次性、混合守恒、并发回放查询与 HTTP 接口 |
 
 ## 核心模型
 
@@ -34,6 +34,59 @@
     本帧不产生任何副本，入端口暂停，避免恢复后重复泛洪。
 - **风暴控制**：统计最近 `stormWindow` 个 tick 的 BUM（广播/组播）帧数，
   超过 `stormThreshold` 后按 `DROP` 立即丢弃或 `LIMIT` 把帧留在队首下一 tick 重试（不丢帧）。
+
+## 事件记录与回放
+
+运行期间，`Simulation` 持续把影响转发结果的事件追加到有界事件日志（`EventLog`）。
+每条事件包含：顺序号 `seq`（从 0 单调递增、唯一连续）、逻辑时间 `tick`、事件类型、
+以及载荷（帧标识、交换机/端口、故障判定值、丢弃原因等）。
+
+事件分两类：
+- **刺激事件**：建模与配置变更（建交换机/端口/主机/链路、改配置、设故障、改 VLAN、接入/摘离）、
+  帧注入 `FRAME_INJECTED`、时钟推进 `TICK`。
+- **决策与结果事件**：故障丢帧判定 `FAULT_DECISION`、错序判定 `REORDER_DECISION`、
+  丢弃 `DROP`、主机送达 `FRAME_DELIVERED`。
+
+### 回放原理
+
+回放（`ReplayEngine`）在**隔离的仿真上下文**中重建一个全新 `Simulation`：
+把日志中的刺激事件按序折叠重放，转发随机判定不再取随机数，而是由
+`RecordedDecisionSource` 按日志中记录的判定值按序给出。因此：
+- 回放结束时刻的转发表、端口状态、统计快照与丢弃事件明细与原始运行**完全一致**；
+- 转发顺序与丢帧结果**逐次一致**；
+- 同一事件序列多次回放结果完全一致；
+- 回放**不修改**在线仿真状态、**不消耗**真实端口队列、**不阻塞**在线推进与查询。
+
+### 重试的一次性语义
+
+帧在暂停（背压）或限速（风暴）重试期间会保留在入端口队首，下一个 tick 重新处理。
+为保证统计与真实收发一致，仿真对每个入队帧用 `IngressFrame` 记录一次性状态：
+- 故障丢帧硬币**只抛一次**（`faultDecided`），重试前后命运不变；
+- 接收计数**只计一次**（`rxCounted`），重试不重复；
+- 发送与丢弃同样只计一次。
+
+### 容量上限与开关
+
+- 事件日志为环形缓冲：容量满后按**确定策略**淘汰最旧事件（FIFO），保留最近一段窗口；
+- 记录**不阻塞**仿真线程，不成为新的背压来源；
+- 可通过接口开关记录与配置容量；**关闭记录时转发行为与统计保持不变**（随机判定照常进行，只是不写日志）。
+
+### 回放范围校验
+
+回放请求可携带事件序号范围 `[fromSeq, toSeq]`，以下请求被明确拒绝并给出可区分原因：
+- `toSeq > latestSeq`：超出已记录范围；
+- `fromSeq < 0` 或 `toSeq < fromSeq`：范围非法；
+- `fromSeq < oldestSeq` 或日志已淘汰（`oldestSeq > 0`）：范围已被日志淘汰，无法完整回放；
+- 日志为空：无事件可回放。
+
+### 统计口径与验证
+
+任意时刻快照满足以下守恒关系（测试 `ReplayTest` 自动校验）：
+- **帧守恒**：`injected + floodNetCopies == hostDelivered + dropEvents + queueDepth + filtered`
+  （`floodNetCopies` 为泛洪净增副本数，`filtered` 为同端口静默过滤的帧数）；
+- **丢弃一致**：`dropEvents.size() == sum(dropReasonCounts) == sum(port.dropped)`；
+- **收发一致**：主机接入端口的 `txFrames ==` 该主机 `rxFrames.size()`；
+- **接收真实**：每个端口的 `rxFrames` 只统计真实到达该端口的帧，重试不重复。
 
 ## 快速开始
 
@@ -63,6 +116,10 @@ mvn test                   # 运行全部测试
 | `POST /api/sim/links` | 交换机互联 `{a:{switchName,portId}, b:{...}}`，自动生成树收敛 |
 | `POST /api/sim/hosts/{name}/inject` | 注入帧 `{dst, vlan, priority(0-7), payload}` |
 | `GET  /api/sim/hosts/{name}/received` | 主机已收帧列表 |
+| `POST /api/sim/replay?from=&to=` | 按记录的事件序列回放 `[from,to]`，缺省回放全部；返回结束状态、事件列表与日志窗口元数据 |
+| `GET  /api/sim/events?from=&to=` | 查询事件日志 `[from,to]`（含端点），缺省返回全部已记录事件 |
+| `GET  /api/sim/event-log` | 事件日志状态（开关、容量、条数、已记录窗口） |
+| `POST /api/sim/event-log?enabled=&capacity=` | 配置事件日志开关与容量（容量缩小时按 FIFO 淘汰） |
 
 `PortConfig` 字段：`capacityPerPriority`、`starvationTicks`、`backpressure(DROP|PAUSE)`、
 `stormThreshold`、`stormWindow`、`stormAction(DROP|LIMIT)`；默认值
@@ -129,6 +186,7 @@ LearningAgingTest     学习、刷新、老化、禁用/VLAN 失效、按 VLAN �
 FloodAndLoopTest      广播/组播/未知单播泛洪、VLAN 约束、入端口排除、三角形环路阻断与收敛
 BackpressureTest      队列上限、DROP/PAUSE 背压、严格优先级、防饿死、每队列独立容量
 FaultAndStormTest     确定性丢帧/错序、故障端口隔离、风暴 DROP/LIMIT、全链路回放一致
+ReplayTest            事件回放一致性/隔离/确定性、序号范围校验、淘汰拒绝、暂停与限速重试计数一次性、重试不改判、混合故障守恒、并发回放与在线查询
 ConcurrentStatsTest   并发读写快照自洽、丢弃事件/原因/端口计数一致、快照不可变
 SimApiTest            HTTP 接口端到端与错误码
 ```
@@ -141,4 +199,7 @@ SimApiTest            HTTP 接口端到端与错误码
 - `sim.core.ForwardingTable`：地址学习表与老化
 - `sim.core.StormGuard`：滑动窗口风暴控制
 - `sim.core.Topology`：链路与确定性生成树
+- `sim.log.EventLog` / `Event` / `EventType`：有界事件序列日志
+- `sim.log.DecisionSource` / `LoggingDecisionSource` / `RecordedDecisionSource`：转发随机判定源（在线取数+记录 / 回放按日志取数）
+- `sim.core.ReplayEngine`：把刺激事件折叠到隔离仿真的回放引擎
 - `sim.model.*`：帧、MAC、配置与不可变视图

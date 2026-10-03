@@ -1,6 +1,7 @@
 package com.github.guoyyit.l2switchsimulatorjava.web;
 
 import com.github.guoyyit.l2switchsimulatorjava.sim.core.Simulation;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.Event;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.Frame;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.FramePriority;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.PortConfig;
@@ -107,6 +108,44 @@ public class SimController {
     @GetMapping("/drops")
     public List<?> drops() {
         return sim.dropEvents();
+    }
+
+    /** 按记录的事件序列回放 [from, to]；缺省回放全部。 */
+    @PostMapping("/replay")
+    public Map<String, Object> replay(@RequestParam(required = false) Long from,
+                                      @RequestParam(required = false) Long to) {
+        long f = from == null ? 0L : from;
+        long latest = sim.eventLogStatus().get("latestSeq") == null
+                ? -1L : ((Number) sim.eventLogStatus().get("latestSeq")).longValue();
+        long t = to == null ? latest : to;
+        Simulation.ReplayResult r = sim.replay(f, t);
+        return Map.of("state", r.state(), "events", r.events(), "fromSeq", r.fromSeq(),
+                "toSeq", r.toSeq(), "oldestSeq", r.oldestSeq(), "latestSeq", r.latestSeq(),
+                "replayedEvents", r.replayedEvents());
+    }
+
+    /** 查询事件日志 [from, to]（含端点）；缺省返回全部已记录事件。 */
+    @GetMapping("/events")
+    public List<Event> events(@RequestParam(required = false) Long from,
+                             @RequestParam(required = false) Long to) {
+        long f = from == null ? 0L : from;
+        long latest = ((Number) sim.eventLogStatus().get("latestSeq")).longValue();
+        long t = to == null ? latest : to;
+        return sim.events(f, t);
+    }
+
+    /** 事件日志状态。 */
+    @GetMapping("/event-log")
+    public Map<String, Object> eventLogStatus() {
+        return sim.eventLogStatus();
+    }
+
+    /** 配置事件日志开关与容量。 */
+    @PostMapping("/event-log")
+    public Map<String, Object> configureEventLog(@RequestParam boolean enabled,
+                                                @RequestParam int capacity) {
+        sim.configureEventLog(enabled, capacity);
+        return sim.eventLogStatus();
     }
 
     @GetMapping("/hosts/{name}/received")

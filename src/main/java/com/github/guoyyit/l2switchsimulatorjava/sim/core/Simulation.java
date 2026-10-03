@@ -11,6 +11,12 @@ import com.github.guoyyit.l2switchsimulatorjava.sim.model.PortFault;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.SimulationView;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.SwitchConfig;
 import com.github.guoyyit.l2switchsimulatorjava.sim.model.SwitchView;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.DecisionSource;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.Event;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.EventLog;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.EventType;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.LoggingDecisionSource;
+import com.github.guoyyit.l2switchsimulatorjava.sim.log.RecordedDecisionSource;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -42,6 +48,8 @@ public final class Simulation {
     private final Map<DropReason, Long> dropReasonCounts = new EnumMap<>(DropReason.class);
     private long injected;
     private long hostDelivered;
+    private final EventLog eventLog = new EventLog();
+    private DecisionSource decisionSource = new LoggingDecisionSource(eventLog);
 
     public Simulation(long seed) {
         this.globalSeed = seed;
@@ -50,35 +58,71 @@ public final class Simulation {
         }
     }
 
+    /** 包级可见：供回放引擎替换为“按日志取判定”的判定源。 */
+    void setDecisionSource(DecisionSource decisionSource) {
+        this.decisionSource = java.util.Objects.requireNonNull(decisionSource, "decisionSource");
+    }
+
+    /** 包级可见：回放引擎读取原始事件日志。 */
+    EventLog eventLog() {
+        return eventLog;
+    }
+
     public synchronized String addSwitch(String name, SwitchConfig config) {
         requireNotExists(name);
-        switches.put(name, new SwitchDevice(name, config));
+        decisionSource.registerSwitch(name, config.seed());
+        switches.put(name, new SwitchDevice(name, config, decisionSource));
+        eventLog.append(tick, EventType.SWITCH_ADDED,
+                Map.of("name", name, "agingTicks", config.agingTicks(), "seed", config.seed()));
         return name;
     }
 
     public synchronized int addPort(String switchName, boolean hostFacing, PortConfig config) {
-        return sw(switchName).addPort(config, hostFacing);
+        int id = sw(switchName).addPort(config, hostFacing);
+        eventLog.append(tick, EventType.PORT_ADDED, Map.of("switchName", switchName, "portId", id,
+                "hostFacing", hostFacing,
+                "capacityPerPriority", config.capacityPerPriority(),
+                "starvationTicks", config.starvationTicks(),
+                "backpressure", config.backpressure().name(),
+                "stormThreshold", config.stormThreshold(),
+                "stormWindow", config.stormWindow(),
+                "stormAction", config.stormAction().name()));
+        return id;
     }
 
     public synchronized void setPortEnabled(String switchName, int portId, boolean enabled) {
         sw(switchName).setPortEnabled(portId, enabled);
+        eventLog.append(tick, EventType.PORT_ENABLED,
+                Map.of("switchName", switchName, "portId", portId, "enabled", enabled));
     }
 
     public synchronized void configurePort(String switchName, int portId, PortConfig config) {
         sw(switchName).configurePort(portId, config);
+        eventLog.append(tick, EventType.PORT_CONFIGURED, Map.of("switchName", switchName, "portId", portId,
+                "capacityPerPriority", config.capacityPerPriority(),
+                "starvationTicks", config.starvationTicks(),
+                "backpressure", config.backpressure().name(),
+                "stormThreshold", config.stormThreshold(),
+                "stormWindow", config.stormWindow(),
+                "stormAction", config.stormAction().name()));
     }
 
     public synchronized void setFault(String switchName, int portId, PortFault fault) {
         sw(switchName).setFault(portId, fault);
+        eventLog.append(tick, EventType.FAULT_SET, Map.of("switchName", switchName, "portId", portId,
+                "dropRate", fault.dropRate(), "reorderEnabled", fault.reorderEnabled()));
     }
 
     public synchronized void setVlan(String switchName, int portId, int vlan) {
         sw(switchName).setVlan(portId, vlan);
+        eventLog.append(tick, EventType.VLAN_SET,
+                Map.of("switchName", switchName, "portId", portId, "vlan", vlan));
     }
 
     public synchronized String addHost(String name, String mac) {
         requireHostNotExists(name);
         hosts.put(name, new Host(name, MacAddress.of(mac)));
+        eventLog.append(tick, EventType.HOST_ADDED, Map.of("name", name, "mac", mac));
         return name;
     }
 
@@ -92,12 +136,15 @@ public final class Simulation {
         detachFromCurrent(h);
         h.attach(switchName, portId);
         s.attachHost(portId, hostName, h.mac());
+        eventLog.append(tick, EventType.HOST_CONNECTED,
+                Map.of("hostName", hostName, "switchName", switchName, "portId", portId));
     }
 
     public synchronized void disconnectHost(String hostName) {
         Host h = host(hostName);
         detachFromCurrent(h);
         h.detach();
+        eventLog.append(tick, EventType.HOST_DISCONNECTED, Map.of("hostName", hostName));
     }
 
     private void detachFromCurrent(Host h) {
@@ -112,11 +159,15 @@ public final class Simulation {
         sw(switchB);
         topology.addLink(switchA, portA, switchB, portB);
         reconverge();
+        eventLog.append(tick, EventType.LINK_ADDED, Map.of("switchA", switchA, "portA", portA,
+                "switchB", switchB, "portB", portB));
     }
 
     public synchronized void removeLink(String switchA, int portA, String switchB, int portB) {
         topology.removeLink(switchA, portA, switchB, portB);
         reconverge();
+        eventLog.append(tick, EventType.LINK_REMOVED, Map.of("switchA", switchA, "portA", portA,
+                "switchB", switchB, "portB", portB));
     }
 
     /** 重新计算生成树并把阻断结果下发到各交换机（主机端口永不阻断）。 */
@@ -141,9 +192,13 @@ public final class Simulation {
         if (loc.switchName() == null) {
             throw new IllegalStateException("主机未接入交换机: " + hostName);
         }
-        Frame frame = new Frame(h.mac(), MacAddress.of(dstMac), vlan, priority, payload);
+        long frameId = injected;
         injected++;
+        Frame frame = new Frame(frameId, h.mac(), MacAddress.of(dstMac), vlan, priority, payload);
         SwitchDevice s = switches.get(loc.switchName());
+        eventLog.append(tick, EventType.FRAME_INJECTED, Map.of("frameId", frameId,
+                "hostName", hostName, "src", h.mac().toString(), "dst", dstMac, "vlan", vlan,
+                "priority", priority.value(), "payload", payload == null ? "" : payload));
         // 入端拒绝（禁用/阻断/队列满）在此记录事件；帧未进入队列，
         // 主机注入场景没有后续 processIngress，因此端口计数也在此补一次
         DropReason reason = s.admitIngress(loc.portId(), frame, true);
@@ -155,6 +210,7 @@ public final class Simulation {
     /** 推进一个 tick：老化 → 入处理 → 出处理。 */
     public synchronized void tick() {
         tick++;
+        eventLog.append(tick, EventType.TICK, Map.of("tick", tick));
         for (SwitchDevice s : switches.values()) {
             s.ageFdb(tick);
         }
@@ -194,6 +250,8 @@ public final class Simulation {
             if (h != null) {
                 h.receive(frame);
                 hostDelivered++;
+                eventLog.append(tick, EventType.FRAME_DELIVERED, Map.of("frameId", frame.id(),
+                        "hostName", h.name(), "switchName", switchName, "portId", portId));
             }
             return null;
         }
@@ -215,6 +273,8 @@ public final class Simulation {
     private void recordDrop(DropReason reason, Frame frame, String switchName, int portId) {
         dropEvents.add(new DropEvent(tick, switchName, portId, reason, frame));
         dropReasonCounts.merge(reason, 1L, Long::sum);
+        eventLog.append(tick, EventType.DROP, Map.of("frameId", frame.id(), "switchName", switchName,
+                "portId", portId, "reason", reason.name()));
     }
 
     public synchronized void tick(int n) {
@@ -246,6 +306,8 @@ public final class Simulation {
         long learned = 0;
         long flooded = 0;
         long dropped = 0;
+        long floodNet = 0;
+        long filtered = 0;
         for (SwitchDevice s : switches.values()) {
             SwitchView v = s.snapshot(tick);
             switchViews.add(v);
@@ -254,6 +316,8 @@ public final class Simulation {
             learned += v.totals().getOrDefault("learned", 0L);
             flooded += v.totals().getOrDefault("flooded", 0L);
             dropped += v.totals().getOrDefault("dropped", 0L);
+            floodNet += s.floodNetCopies();
+            filtered += s.filtered();
         }
         List<HostView> hostViews = new ArrayList<>(hosts.size());
         for (Host h : hosts.values()) {
@@ -281,6 +345,8 @@ public final class Simulation {
         totals.put("flooded", flooded);
         totals.put("dropped", dropped);
         totals.put("dropEvents", (long) dropEvents.size());
+        totals.put("floodNetCopies", floodNet);
+        totals.put("filtered", filtered);
         return new SimulationView(tick, List.copyOf(switchViews), List.copyOf(hostViews),
                 topology.linksView(), List.copyOf(blockedPorts),
                 Map.copyOf(reasons), Map.copyOf(totals));
@@ -298,6 +364,77 @@ public final class Simulation {
         }
         this.injected = 0;
         this.hostDelivered = 0;
+        this.eventLog.clear();
+    }
+
+    /** 回放结果：回放结束时刻的状态、[fromSeq,toSeq] 内的事件与日志窗口元数据。 */
+    public record ReplayResult(SimulationView state, List<Event> events, List<DropEvent> dropEvents,
+                               long fromSeq, long toSeq, long oldestSeq, long latestSeq,
+                               long replayedEvents) {
+    }
+
+    /** 查询事件日志中 [fromSeq, toSeq]（含端点）的事件，按 seq 升序。 */
+    public List<Event> events(long fromSeq, long toSeq) {
+        validateRange(fromSeq, toSeq);
+        return eventLog.eventsBetween(fromSeq, toSeq);
+    }
+
+    /** 事件日志状态（开关、容量、当前条数、已记录窗口）。 */
+    public Map<String, Object> eventLogStatus() {
+        return Map.of("enabled", eventLog.isEnabled(), "capacity", eventLog.capacity(),
+                "size", eventLog.size(), "oldestSeq", eventLog.oldestSeq(), "latestSeq", eventLog.latestSeq());
+    }
+
+    /** 配置事件日志开关与容量（容量缩小时按 FIFO 淘汰最旧事件）。 */
+    public void configureEventLog(boolean enabled, int capacity) {
+        eventLog.configure(enabled, capacity);
+    }
+
+    /**
+     * 按记录的事件序列在隔离的仿真上下文中回放 [fromSeq, toSeq]。
+     *
+     * <p>回放不修改在线仿真状态、不消耗真实端口队列；回放使用独立的 {@link Simulation}，
+     * 转发判定由日志中记录的值按序给出，因此多次回放与原始运行逐次一致。
+     */
+    public ReplayResult replay(long fromSeq, long toSeq) {
+        long oldest = eventLog.oldestSeq();
+        long latest = eventLog.latestSeq();
+        if (latest < 0) {
+            throw new IllegalStateException("事件日志为空，无法回放");
+        }
+        validateRange(fromSeq, toSeq, oldest, latest);
+        Simulation replaySim = new Simulation(globalSeed);
+        replaySim.configureEventLog(false, eventLog.capacity());
+        replaySim.setDecisionSource(new RecordedDecisionSource(eventLog));
+        int replayed = ReplayEngine.fold(replaySim, eventLog, toSeq);
+        List<Event> events = eventLog.eventsBetween(fromSeq, toSeq);
+        return new ReplayResult(replaySim.snapshot(), events, replaySim.dropEvents(), fromSeq, toSeq,
+                oldest, latest, replayed);
+    }
+
+    private static void validateRange(long fromSeq, long toSeq) {
+        if (fromSeq < 0) {
+            throw new IllegalArgumentException("回放范围非法: fromSeq=" + fromSeq + " < 0");
+        }
+        if (toSeq < fromSeq) {
+            throw new IllegalArgumentException("回放范围非法: toSeq=" + toSeq + " < fromSeq=" + fromSeq);
+        }
+    }
+
+    private static void validateRange(long fromSeq, long toSeq, long oldest, long latest) {
+        validateRange(fromSeq, toSeq);
+        if (fromSeq < oldest) {
+            throw new IllegalArgumentException(
+                    "回放范围已被日志淘汰: fromSeq=" + fromSeq + " < oldestSeq=" + oldest);
+        }
+        if (oldest > 0) {
+            throw new IllegalStateException(
+                    "事件日志已被淘汰: oldestSeq=" + oldest + "，无法完整回放");
+        }
+        if (toSeq > latest) {
+            throw new IllegalArgumentException(
+                    "回放范围超出已记录范围: toSeq=" + toSeq + " > latestSeq=" + latest);
+        }
     }
 
     private SwitchDevice sw(String name) {

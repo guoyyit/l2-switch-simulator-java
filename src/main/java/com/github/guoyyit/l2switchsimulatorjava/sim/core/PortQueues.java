@@ -26,7 +26,7 @@ public final class PortQueues {
     private int capacityPerPriority;
     @SuppressWarnings("unchecked")
     private final Deque<Entry>[] egress = new Deque[8];
-    private final Deque<Frame> ingress = new LinkedList<>();
+    private final Deque<IngressFrame> ingress = new LinkedList<>();
     private int ingressCapacity;
     private boolean ingressPaused;
 
@@ -136,19 +136,25 @@ public final class PortQueues {
         ingressPaused = false;
     }
 
+    /** 入队一帧（包装为一次性处理状态）。 */
     public boolean offerIngress(Frame frame) {
         if (ingress.size() >= ingressCapacity) {
             return false;
         }
-        ingress.addLast(frame);
+        ingress.addLast(new IngressFrame(frame));
         return true;
     }
 
-    public Frame peekIngress() {
+    /** 直接把一个已包装的入队帧放回队首（重试时保留其一次性状态）。 */
+    public void offerIngressFrame(IngressFrame head) {
+        ingress.addFirst(head);
+    }
+
+    public IngressFrame peekIngressFrame() {
         return ingress.peekFirst();
     }
 
-    public Frame pollIngress() {
+    public IngressFrame pollIngressFrame() {
         return ingress.pollFirst();
     }
 
@@ -157,12 +163,12 @@ public final class PortQueues {
      * 原队首留在新队首，后续会按正常流程处理——它已参与过一次交换，不会再被交换。
      * 返回取出的原次队首；队列不足两帧时回退为普通出队。
      */
-    public Frame swapAndPollFirstTwo() {
+    public IngressFrame swapAndPollFirstTwo() {
         if (ingress.size() < 2) {
             return ingress.pollFirst();
         }
-        Frame head = ingress.pollFirst();
-        Frame second = ingress.pollFirst();
+        IngressFrame head = ingress.pollFirst();
+        IngressFrame second = ingress.pollFirst();
         ingress.addFirst(head);   // 队列变为 [head, ...]
         return second;            // second 交由调用方立即处理
     }
