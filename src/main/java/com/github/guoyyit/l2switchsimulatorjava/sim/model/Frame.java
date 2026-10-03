@@ -1,6 +1,7 @@
 package com.github.guoyyit.l2switchsimulatorjava.sim.model;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Objects;
 
 /**
@@ -14,6 +15,14 @@ import java.util.Objects;
  */
 public final class Frame {
 
+    private static final java.util.concurrent.atomic.AtomicLong ID_GEN =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * 全局唯一帧标识；同一注入产生的泛洪副本共享同一标识。
+     * 正常运行时全局分配，回放时复用原运行记录的标识，保证同一帧在两次运行中标识一致。
+     */
+    private final long id;
     private final MacAddress src;
     private final MacAddress dst;
     private final int vlan;
@@ -21,6 +30,12 @@ public final class Frame {
     private final String payload;
 
     public Frame(MacAddress src, MacAddress dst, int vlan, FramePriority priority, String payload) {
+        this(src, dst, vlan, priority, payload, ID_GEN.incrementAndGet());
+    }
+
+    /** 回放用：显式指定帧标识。 */
+    public Frame(MacAddress src, MacAddress dst, int vlan, FramePriority priority, String payload,
+                 long id) {
         this.src = Objects.requireNonNull(src, "src");
         this.dst = Objects.requireNonNull(dst, "dst");
         if (src.isGroup()) {
@@ -32,6 +47,7 @@ public final class Frame {
         this.vlan = vlan;
         this.priority = Objects.requireNonNull(priority, "priority");
         this.payload = payload == null ? "" : payload;
+        this.id = id;
     }
 
     @JsonProperty
@@ -57,6 +73,12 @@ public final class Frame {
     @JsonProperty
     public String payload() {
         return payload;
+    }
+
+    /** 全局唯一帧标识，仅用于事件记录区分不同注入（不参与值相等）。 */
+    @JsonProperty
+    public long id() {
+        return id;
     }
 
     @JsonProperty("broadcast")

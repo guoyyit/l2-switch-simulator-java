@@ -32,18 +32,63 @@ import java.util.Random;
  */
 public final class SwitchDevice {
 
-    /** 转发/丢弃事件回调，由仿真层统一记录。 */
+    /**
+     * 转发过程中的事件回调，由仿真层统一记录。
+     * 所有回调都在仿真全局锁内、按真实发生顺序触发。
+     */
     public interface EventSink {
-        void dropped(int portId, DropReason reason, Frame frame);
+        /** 一帧真实到达并入端口暂存队列（每帧每端口至多一次）。 */
+        void admitted(int portId, Frame frame);
 
+        /** 一帧到达后在入队前被拒绝（禁用/阻断/入队列满）。 */
+        void rejected(int portId, DropReason reason, Frame frame);
+
+        /** 一次故障随机判定（同一帧只发生一次，重试复用结果）。 */
+        void faultVerdict(int portId, Frame frame, boolean dropDrawn, boolean reorderDrawn);
+
+        /** 源 MAC 新增学习。 */
+        void learned(int portId, Frame frame);
+
+        /** 一份泛洪副本从该端口发出。 */
         void flooded(int portId, Frame frame);
 
-        void learned(int portId, Frame frame);
+        /** 帧被留在队首等待后续 tick 重试（风暴 LIMIT 或背压 PAUSE）。 */
+        void deferred(int portId, Frame frame, String cause);
+
+        void dropped(int portId, DropReason reason, Frame frame);
+    }
+
+    /**
+     * 故障随机判定来源。在线运行时用端口专属 {@link Random} 抽取并经事件汇录；
+     * 回放时由记录的判定结果提供，保证同一帧命运不变。
+     */
+    public interface FaultChance {
+        /**
+         * @return 两元素判定：[0]=是否丢帧，[1]=是否错序交换
+         */
+        boolean[] decide(int portId, Frame frame, double dropRate, boolean reorderEnabled);
+    }
+
+    /** 默认在线判定：每端口独立 {@link Random}。 */
+    public final class RandomFaultChance implements FaultChance {
+        @Override
+        public boolean[] decide(int portId, Frame frame, double dropRate, boolean reorderEnabled) {
+            Random rng = port(portId).faultRng;
+            boolean drop = rng.nextDouble() < dropRate;
+            // 仅在启用错序时才消耗这枚硬币，保持与既有序列相同的随机消费次序
+            boolean reorder = reorderEnabled && rng.nextDouble() < 0.5;
+            return new boolean[]{drop, reorder};
+        }
     }
 
     /** 出帧投递结果：null 表示成功，否则为邻居入端口给出的丢弃原因。 */
     public interface Transmitter {
         DropReason transmit(int egressPortId, Frame frame);
+    }
+
+    /** 帧真正从出端口发出时计一次发送（由仿真层 transmit 调用）。 */
+    public void countTx(int portId) {
+        port(portId).txFrames++;
     }
 
     private static final class Port {
@@ -65,6 +110,11 @@ public final class SwitchDevice {
         long flooded;
         long dropped;
         long pausedTicks;
+        long ingressArrivals;
+        long admissionRejected;
+        long filtered;
+        long ingressDropped;
+        long egressDropped;
 
         Port(int id, boolean hostFacing, int vlan, PortConfig config, Random faultRng) {
             this.id = id;
@@ -86,12 +136,18 @@ public final class SwitchDevice {
     private long agingTicks;
     private final List<Port> ports = new ArrayList<>();
     private ForwardingTable fdb;
+    private FaultChance faultChance = new RandomFaultChance();
 
     public SwitchDevice(String name, SwitchConfig config) {
         this.name = name;
         this.seed = config.seed();
         this.agingTicks = config.agingTicks();
         this.fdb = new ForwardingTable(agingTicks);
+    }
+
+    /** 注入故障判定来源（回放时使用记录结果）。 */
+    public void setFaultChance(FaultChance chance) {
+        this.faultChance = chance == null ? new RandomFaultChance() : chance;
     }
 
     public String name() {
@@ -109,6 +165,27 @@ public final class SwitchDevice {
         return ports.get(portId);
     }
 
+    /**
+     * 统一丢弃计数归类（保证统计可交叉核对）：
+     * <ul>
+     *   <li>入端拒绝（帧未入队）：admissionRejected；</li>
+     *   <li>入处理丢弃（已到达、在入处理阶段判定）：ingressDropped；</li>
+     *   <li>输出侧丢弃（已进入转发决策后）：egressDropped。</li>
+     * </ul>
+     * 三者都计入 {@code dropped} 总量，但口径互不重叠。
+     */
+    private static void countDrop(Port p, DropReason reason) {
+        p.dropped++;
+        switch (reason) {
+            case DISABLED_INGRESS, LOOP_BLOCKED_INGRESS, INGRESS_QUEUE_FULL ->
+                    p.admissionRejected++;
+            case FAULT_DROP, STORM_CONTROL, NO_MEMBER_PORTS ->
+                    p.ingressDropped++;
+            case QUEUE_FULL, DISABLED_EGRESS, LOOP_BLOCKED_EGRESS ->
+                    p.egressDropped++;
+        }
+    }
+
     public int addPort(PortConfig config, boolean hostFacing) {
         int id = ports.size();
         long portSeed = seed ^ (0x9E3779B97F4A7C15L * (id + 1L));
@@ -116,17 +193,39 @@ public final class SwitchDevice {
         return id;
     }
 
-    public void setPortEnabled(int portId, boolean enabled) {
+    public void setPortEnabled(int portId, boolean enabled, EventSink sink) {
         Port p = port(portId);
         if (p.enabled == enabled) {
             return;
         }
         p.enabled = enabled;
         if (!enabled) {
-            // 确定性失效策略：端口禁用立即清空队列并删除该端口学到的条目
-            p.queues.clear();
+            // 确定性失效策略：端口禁用立即清空队列并删除该端口学到的条目。
+            // 清出的帧是真实到达/排队过的帧：逐一记录丢弃，保证统计守恒、
+            // 不出现“已到达/已发送却凭空消失”的帧。
+            clearQueuesAsDropped(p, sink);
             fdb.invalidatePort(portId);
         }
+    }
+
+    /** 清空端口全部队列并把帧计为丢弃：入端口暂存帧计 INGRESS 类，输出队列帧计 EGRESS 类。 */
+    private void clearQueuesAsDropped(Port p, EventSink sink) {
+        DropReason ingressReason = DropReason.DISABLED_INGRESS;
+        PortQueues.IngressFrame item;
+        while ((item = p.queues.pollIngress()) != null) {
+            countDrop(p, ingressReason);
+            if (sink != null) {
+                sink.dropped(p.id, ingressReason, item.frame());
+            }
+        }
+        Frame f;
+        while ((f = p.queues.pollAnyEgress()) != null) {
+            countDrop(p, DropReason.DISABLED_EGRESS);
+            if (sink != null) {
+                sink.dropped(p.id, DropReason.DISABLED_EGRESS, f);
+            }
+        }
+        p.queues.setIngressPaused(false);
     }
 
     public boolean isPortEnabled(int portId) {
@@ -184,7 +283,16 @@ public final class SwitchDevice {
      *
      * @return 丢弃原因；null 表示已进入入端口暂存队列
      */
-    public DropReason admitIngress(int portId, Frame frame, boolean countDrop) {
+    /**
+     * 主机或邻居向端口入队一帧。
+     *
+     * <p>到达即计数：成功进入入端口暂存队列计一次 {@code ingressArrivals}
+     * （后续暂停/限速重试不再计数，保证同一帧只计一次接收）；
+     * 入队前被拒绝计一次 {@code admissionRejected} 并返回拒绝原因。
+     *
+     * @return 拒绝原因；null 表示已进入入端口暂存队列
+     */
+    public DropReason admitIngress(int portId, Frame frame, EventSink sink) {
         Port p = port(portId);
         DropReason reason = null;
         if (!p.enabled) {
@@ -192,10 +300,18 @@ public final class SwitchDevice {
         } else if (p.blocked) {
             reason = DropReason.LOOP_BLOCKED_INGRESS;
         } else if (!p.queues.offerIngress(frame)) {
-            reason = DropReason.QUEUE_FULL;
+            reason = DropReason.INGRESS_QUEUE_FULL;
         }
-        if (reason != null && countDrop) {
-            p.dropped++;
+        if (reason != null) {
+            countDrop(p, reason);
+            if (sink != null) {
+                sink.rejected(portId, reason, frame);
+            }
+        } else {
+            p.ingressArrivals++;
+            if (sink != null) {
+                sink.admitted(portId, frame);
+            }
         }
         return reason;
     }
@@ -222,46 +338,60 @@ public final class SwitchDevice {
 
     private void drainDropped(Port p, EventSink sink) {
         DropReason reason = p.enabled ? DropReason.LOOP_BLOCKED_INGRESS : DropReason.DISABLED_INGRESS;
-        Frame f;
-        while ((f = p.queues.pollIngress()) != null) {
-            p.dropped++;
-            sink.dropped(p.id, reason, f);
+        PortQueues.IngressFrame item;
+        while ((item = p.queues.pollIngress()) != null) {
+            countDrop(p, reason);
+            sink.dropped(p.id, reason, item.frame());
         }
+        // 阻断不清输出队列（输出仍可调度，符合既有语义）；暂停态随队列排空而解除
+        p.queues.setIngressPaused(false);
     }
 
     private void processOnePortIngress(Port p, long now, EventSink sink) {
-        boolean skipSwapForHead = false;
         while (true) {
-            Frame frame = p.queues.peekIngress();
-            if (frame == null) {
+            PortQueues.IngressFrame headItem = p.queues.peekIngress();
+            if (headItem == null) {
                 return;
             }
-            // 故障丢帧：端口独立的确定性随机源，不影响其他端口的随机序列
-            if (p.fault.dropRate() > 0.0 && p.faultRng.nextDouble() < p.fault.dropRate()) {
+
+            // 故障判定对同一帧只做一次：首次处理时抽取（并记录），
+            // 之后无论 PAUSE 还是风暴 LIMIT 导致多少次重试，都复用冻结结果。
+            if (!headItem.decided()) {
+                boolean[] verdict = faultChance.decide(p.id, headItem.frame(),
+                        p.fault.dropRate(), p.fault.reorderEnabled());
+                headItem.decide(verdict[0], verdict[1]);
+                sink.faultVerdict(p.id, headItem.frame(), verdict[0], verdict[1]);
+            }
+
+            if (headItem.dropDrawn()) {
                 p.queues.pollIngress();
-                p.dropped++;
-                sink.dropped(p.id, DropReason.FAULT_DROP, frame);
-                skipSwapForHead = false;
+                countDrop(p, DropReason.FAULT_DROP);
+                sink.dropped(p.id, DropReason.FAULT_DROP, headItem.frame());
                 continue;
             }
-            // 故障错序：队首若有后继且未参与过上一次交换，则投一次硬币；
-            // 命中则与后继交换并立即处理后继，被换到队首的原队首跳过下一次抛硬币，
-            // 因此每帧至多参与一次交换，结果确定且不会来回抖动
-            if (!skipSwapForHead && p.fault.reorderEnabled() && p.queues.ingressDepth() >= 2
-                    && p.faultRng.nextDouble() < 0.5) {
-                frame = p.queues.swapAndPollFirstTwo();
-                skipSwapForHead = true;
-            } else {
-                p.queues.pollIngress();
-                skipSwapForHead = false;
+
+            // 故障错序：同一帧至多参与一次交换。队首若有后继、自身未参与过交换，
+            // 且首次判定的错序硬币命中，则把后继取出立即处理，原队首留下一轮处理。
+            PortQueues.IngressFrame item = headItem;
+            boolean headWillStay = false;
+            if (!headItem.swapExempt() && p.fault.reorderEnabled()
+                    && p.queues.ingressDepth() >= 2 && headItem.reorderDrawn()) {
+                item = p.queues.swapAndPollFirstTwo();
+                // 原队首（仍在队首）已参与一次交换，此后不再参与
+                p.queues.peekIngress().markSwapExempt();
+                // 被取出的后继立即处理；它本身也已参与过一次交换
+                item.markSwapExempt();
+                headWillStay = true;
             }
-            p.rxFrames++;
+            Frame frame = item.frame();
 
             if (fdb.learn(frame.src(), p.id, frame.vlan(), now)) {
                 p.learned++;
                 sink.learned(p.id, frame);
             }
 
+            long ingressDropsBefore = p.ingressDropped;
+            long filteredBefore = p.filtered;
             IngressResult result;
             if (frame.isGroup()) {
                 result = handleGroup(p, frame, now, sink);
@@ -269,25 +399,45 @@ public final class SwitchDevice {
                 result = handleUnicast(p, frame, now, sink);
             }
             if (result == IngressResult.RETRY_HEAD) {
-                requeueAtHead(p, frame);
+                // 交换命中时 item（后继）已出队、原队首仍在队列；
+                // 未交换时 item 仍在队首，需先取出。两种情况统一放回队首，
+                // 得到 [item, 原队首, ...]，下一 tick 优先重试 item。
+                if (!headWillStay) {
+                    p.queues.pollIngress();
+                }
+                requeueAtHead(p, item);
+                sink.deferred(p.id, frame, "STORM_LIMIT");
                 return;
             }
             if (result == IngressResult.PAUSED) {
-                requeueAtHead(p, frame);
+                if (!headWillStay) {
+                    p.queues.pollIngress();
+                }
+                requeueAtHead(p, item);
                 p.queues.setIngressPaused(true);
+                sink.deferred(p.id, frame, "PAUSE");
                 return;
+            }
+            // DONE：若交换后原队首仍在队列里，本帧（后继）已取出，正常移除即可；
+            // 非交换情形需把队首取出。
+            if (!headWillStay) {
+                p.queues.pollIngress();
+            }
+            // 只有真正完成入处理（未在入处理阶段被丢弃）的帧才计接收
+            if (p.ingressDropped == ingressDropsBefore && p.filtered == filteredBefore) {
+                p.rxFrames++;
             }
         }
     }
 
-    private void requeueAtHead(Port p, Frame frame) {
-        List<Frame> rest = new ArrayList<>();
-        Frame f;
+    private void requeueAtHead(Port p, PortQueues.IngressFrame item) {
+        List<PortQueues.IngressFrame> rest = new ArrayList<>();
+        PortQueues.IngressFrame f;
         while ((f = p.queues.pollIngress()) != null) {
             rest.add(f);
         }
-        p.queues.offerIngress(frame);
-        for (Frame r : rest) {
+        p.queues.offerIngress(item);
+        for (PortQueues.IngressFrame r : rest) {
             p.queues.offerIngress(r);
         }
     }
@@ -296,12 +446,14 @@ public final class SwitchDevice {
     private IngressResult handleGroup(Port p, Frame frame, long now, EventSink sink) {
         StormGuard.Decision decision = p.storm.observe(now);
         if (decision == StormGuard.Decision.DROP) {
-            p.dropped++;
+            countDrop(p, DropReason.STORM_CONTROL);
             sink.dropped(p.id, DropReason.STORM_CONTROL, frame);
             return IngressResult.DONE;
         }
         if (decision == StormGuard.Decision.LIMIT) {
-            // 限速：帧保留在队首，下一个 tick 优先重试
+            // 限速：帧保留在队首，下一个 tick 优先重试。
+            // 风暴判定是与 tick 相关的时间决策，重试时重新评估；
+            // 但故障判定已冻结，绝不重抽。deferred 由主循环统一记录。
             return IngressResult.RETRY_HEAD;
         }
         return flood(p, frame, now, sink);
@@ -315,19 +467,21 @@ public final class SwitchDevice {
         }
         Port out = ports.get(target.get().portId());
         if (out.id == p.id) {
-            // 目的与源在同一端口（如发往本端口下挂主机），交换机静默过滤
+            // 目的与源在同一端口（如发往本端口下挂主机），交换机静默过滤。
+            // 计入 filtered 以保持“到达 == 丢弃 + 发出排队 + 过滤”守恒。
+            p.filtered++;
             return IngressResult.DONE;
         }
         if (out.vlan != frame.vlan()) {
             return flood(p, frame, now, sink);
         }
         if (!out.enabled) {
-            p.dropped++;
+            countDrop(p, DropReason.DISABLED_EGRESS);
             sink.dropped(p.id, DropReason.DISABLED_EGRESS, frame);
             return IngressResult.DONE;
         }
         if (out.blocked) {
-            p.dropped++;
+            countDrop(p, DropReason.LOOP_BLOCKED_EGRESS);
             sink.dropped(p.id, DropReason.LOOP_BLOCKED_EGRESS, frame);
             return IngressResult.DONE;
         }
@@ -351,7 +505,7 @@ public final class SwitchDevice {
             candidates.add(out);
         }
         if (candidates.isEmpty()) {
-            in.dropped++;
+            countDrop(in, DropReason.NO_MEMBER_PORTS);
             sink.dropped(in.id, DropReason.NO_MEMBER_PORTS, frame);
             return IngressResult.DONE;
         }
@@ -367,7 +521,7 @@ public final class SwitchDevice {
                 copies++;
             } else {
                 // DROP 策略下该副本丢弃，其余副本照常
-                in.dropped++;
+                countDrop(in, DropReason.QUEUE_FULL);
                 sink.dropped(in.id, DropReason.QUEUE_FULL, frame);
             }
         }
@@ -382,7 +536,7 @@ public final class SwitchDevice {
         if (out.config.backpressure() == BackpressureAction.PAUSE) {
             return IngressResult.PAUSED;
         }
-        in.dropped++;
+        countDrop(in, DropReason.QUEUE_FULL);
         sink.dropped(in.id, DropReason.QUEUE_FULL, frame);
         return IngressResult.DONE;
     }
@@ -408,7 +562,8 @@ public final class SwitchDevice {
                 continue;
             }
             transmitter.transmit(p.id, frame);
-            p.txFrames++;
+            // 发送计数由仿真层 transmit 统一在真正发出时计一次
+            // （processEgress 自身不再加，避免与 transmit 双重计数）。
         }
     }
 
@@ -428,17 +583,29 @@ public final class SwitchDevice {
         long flooded = 0;
         long dropped = 0;
         long paused = 0;
+        long arrivals = 0;
+        long rejected = 0;
+        long filtered = 0;
+        long ingressDropped = 0;
+        long egressDropped = 0;
         for (Port p : ports) {
             PortCountersView c = new PortCountersView(p.rxFrames, p.txFrames, p.learned, p.flooded,
-                    p.dropped, p.pausedTicks);
+                    p.dropped, p.pausedTicks, p.ingressArrivals, p.admissionRejected, p.filtered,
+                    p.ingressDropped, p.egressDropped);
             portViews.add(new PortView(p.id, p.enabled, p.blocked, p.hostFacing,
-                    p.queues.isIngressPaused(), p.vlan, p.attachedHost, p.fault, p.queues.depths(), c));
+                    p.queues.isIngressPaused(), p.vlan, p.attachedHost, p.fault,
+                    p.queues.ingressDepth(), p.queues.depths(), c));
             rx += p.rxFrames;
             tx += p.txFrames;
             learned += p.learned;
             flooded += p.flooded;
             dropped += p.dropped;
             paused += p.pausedTicks;
+            arrivals += p.ingressArrivals;
+            rejected += p.admissionRejected;
+            filtered += p.filtered;
+            ingressDropped += p.ingressDropped;
+            egressDropped += p.egressDropped;
         }
         Map<String, Long> totals = new LinkedHashMap<>();
         totals.put("rxFrames", rx);
@@ -447,9 +614,13 @@ public final class SwitchDevice {
         totals.put("flooded", flooded);
         totals.put("dropped", dropped);
         totals.put("pausedTicks", paused);
+        totals.put("ingressArrivals", arrivals);
+        totals.put("admissionRejected", rejected);
+        totals.put("filtered", filtered);
+        totals.put("ingressDropped", ingressDropped);
+        totals.put("egressDropped", egressDropped);
         return new SwitchView(name, tick, agingTicks, true, portViews, fdb.snapshot(),
                 Map.copyOf(totals));
     }
 
 }
-

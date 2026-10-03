@@ -23,10 +23,65 @@ public final class PortQueues {
     private record Entry(Frame frame, long enqueueTick) {
     }
 
+    /**
+     * 入端口暂存队列条目。
+     *
+     * <p>除帧外，还携带该帧在本端口“只做一次”的故障判定结果：
+     * 首次真正处理（peek 到队首并需要判定）时由交换机填入，之后无论帧因
+     * PAUSE 还是风暴 LIMIT 被留在队首重试多少次，都复用同一判定，绝不重新抽取。
+     *
+     * @param decided      是否已完成故障判定
+     * @param dropDrawn    判定结果：是否丢帧
+     * @param reorderDrawn 判定结果：是否与后继交换
+     * @param swapExempt   该条目已参与过一次错序交换，此后不再参与
+     */
+    public static final class IngressFrame {
+        private final Frame frame;
+        private boolean decided;
+        private boolean dropDrawn;
+        private boolean reorderDrawn;
+        private boolean swapExempt;
+
+        public IngressFrame(Frame frame) {
+            this.frame = frame;
+        }
+
+        public Frame frame() {
+            return frame;
+        }
+
+        public boolean decided() {
+            return decided;
+        }
+
+        public boolean dropDrawn() {
+            return dropDrawn;
+        }
+
+        public boolean reorderDrawn() {
+            return reorderDrawn;
+        }
+
+        public boolean swapExempt() {
+            return swapExempt;
+        }
+
+        /** 填入首次判定结果；重复调用必须给出相同结果（由调用方保证只判定一次）。 */
+        public void decide(boolean dropDrawn, boolean reorderDrawn) {
+            this.decided = true;
+            this.dropDrawn = dropDrawn;
+            this.reorderDrawn = reorderDrawn;
+        }
+
+        public void markSwapExempt() {
+            this.swapExempt = true;
+        }
+    }
+
     private int capacityPerPriority;
     @SuppressWarnings("unchecked")
     private final Deque<Entry>[] egress = new Deque[8];
-    private final Deque<Frame> ingress = new LinkedList<>();
+    private final Deque<IngressFrame> ingress = new LinkedList<>();
     private int ingressCapacity;
     private boolean ingressPaused;
 
@@ -136,19 +191,34 @@ public final class PortQueues {
         ingressPaused = false;
     }
 
+    /** 跨优先级逐帧取出全部输出队列内容（确定性顺序：优先级 0..7，队首到队尾）。 */
+    public Frame pollAnyEgress() {
+        for (int p = 0; p < 8; p++) {
+            Entry e = egress[p].pollFirst();
+            if (e != null) {
+                return e.frame();
+            }
+        }
+        return null;
+    }
+
     public boolean offerIngress(Frame frame) {
+        return offerIngress(new IngressFrame(frame));
+    }
+
+    public boolean offerIngress(IngressFrame item) {
         if (ingress.size() >= ingressCapacity) {
             return false;
         }
-        ingress.addLast(frame);
+        ingress.addLast(item);
         return true;
     }
 
-    public Frame peekIngress() {
+    public IngressFrame peekIngress() {
         return ingress.peekFirst();
     }
 
-    public Frame pollIngress() {
+    public IngressFrame pollIngress() {
         return ingress.pollFirst();
     }
 
@@ -157,12 +227,12 @@ public final class PortQueues {
      * 原队首留在新队首，后续会按正常流程处理——它已参与过一次交换，不会再被交换。
      * 返回取出的原次队首；队列不足两帧时回退为普通出队。
      */
-    public Frame swapAndPollFirstTwo() {
+    public IngressFrame swapAndPollFirstTwo() {
         if (ingress.size() < 2) {
             return ingress.pollFirst();
         }
-        Frame head = ingress.pollFirst();
-        Frame second = ingress.pollFirst();
+        IngressFrame head = ingress.pollFirst();
+        IngressFrame second = ingress.pollFirst();
         ingress.addFirst(head);   // 队列变为 [head, ...]
         return second;            // second 交由调用方立即处理
     }

@@ -9,5 +9,6 @@ public enum DropReason {
     LOOP_BLOCKED_EGRESS,
     STORM_CONTROL,
     QUEUE_FULL,
+    INGRESS_QUEUE_FULL,
     NO_MEMBER_PORTS
 }

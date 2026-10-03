@@ -11,6 +11,7 @@ public record PortView(int portId,
                        int vlan,
                        String attachedHost,
                        PortFault fault,
+                       int ingressDepth,
                        List<Integer> queueDepths,
                        PortCountersView counters) {
 }
